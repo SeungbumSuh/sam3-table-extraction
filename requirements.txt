@@ -1,1 +1,2 @@
 git+https://github.com/Sompote/SAM3_LoRA.git
+python-dotenv
