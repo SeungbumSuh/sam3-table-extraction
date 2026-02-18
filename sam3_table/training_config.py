@@ -59,8 +59,31 @@ class LoRAConfig(BaseModel):
     apply_to_mask_decoder: bool = True
 
 
+class DatasetSplit(BaseModel):
+    """Paths for a single dataset split (train or valid)."""
+
+    image_dir: Path = Field(..., description="Directory containing the images")
+    annotation_file: Path = Field(
+        ..., description="Path to the COCO-format annotation JSON"
+    )
+
+    @field_validator("annotation_file")
+    @classmethod
+    def annotation_must_be_json(cls, v: Path) -> Path:
+        if v.suffix.lower() != ".json":
+            raise ValueError(f"annotation_file must be a .json file, got '{v.suffix}'")
+        return v
+
+
+class DataConfig(BaseModel):
+    """Dataset configuration with explicit paths per split."""
+
+    train: DatasetSplit
+    valid: Optional[DatasetSplit] = None
+
+
 class TrainingConfig(BaseModel):
-    data_dir: str = "/workspace/data"
+    data: DataConfig
     batch_size: int = Field(4, gt=0)
     num_workers: int = Field(2, ge=0)
 

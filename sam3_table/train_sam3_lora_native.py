@@ -49,7 +49,8 @@ from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
 from sam3.model.box_ops import box_xywh_to_xyxy
 from lora_layers import LoRAConfig as LoRALayerConfig, apply_lora_to_model, save_lora_weights, count_parameters
-from training_config import SAM3LoRAConfig
+from training_config import SAM3LoRAConfig, DatasetSplit
+from coco_schema import COCODataset, RLESegmentation
 
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
@@ -108,42 +109,33 @@ def print_rank0(*args, **kwargs):
 
 
 class COCOSegmentDataset(Dataset):
-    """Dataset class for COCO format segmentation data"""
-    def __init__(self, data_dir, split="train"):
-        """
-        Args:
-            data_dir: Root directory containing train/valid/test folders
-            split: One of 'train', 'valid', 'test'
-        """
-        self.data_dir = Path(data_dir)
-        self.split = split
-        self.split_dir = self.data_dir / split
+    """Dataset class for COCO format segmentation data."""
 
-        # Load COCO annotations
-        ann_file = self.split_dir / "_annotations.coco.json"
+    def __init__(self, split_config: DatasetSplit):
+        self.image_dir = split_config.image_dir
+        ann_file = split_config.annotation_file
+
         if not ann_file.exists():
             raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
 
-        with open(ann_file, 'r') as f:
-            self.coco_data = json.load(f)
+        self.coco_data = COCODataset.from_json(ann_file)
 
         # Build index: image_id -> image info
-        self.images = {img['id']: img for img in self.coco_data['images']}
-        self.image_ids = sorted(list(self.images.keys()))
+        self.images = {img.id: img for img in self.coco_data.images}
+        self.image_ids = sorted(self.images.keys())
 
         # Build index: image_id -> list of annotations
-        self.img_to_anns = {}
-        for ann in self.coco_data['annotations']:
-            img_id = ann['image_id']
-            if img_id not in self.img_to_anns:
-                self.img_to_anns[img_id] = []
-            self.img_to_anns[img_id].append(ann)
+        self.img_to_anns: dict[int, list] = {}
+        for ann in self.coco_data.annotations:
+            if ann.image_id not in self.img_to_anns:
+                self.img_to_anns[ann.image_id] = []
+            self.img_to_anns[ann.image_id].append(ann)
 
         # Load categories
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
-        print(f"Loaded COCO dataset: {split} split")
+        self.categories = {cat.id: cat.name for cat in self.coco_data.categories}
+        print(f"Loaded COCO dataset from {self.image_dir}")
         print(f"  Images: {len(self.image_ids)}")
-        print(f"  Annotations: {len(self.coco_data['annotations'])}")
+        print(f"  Annotations: {len(self.coco_data.annotations)}")
         print(f"  Categories: {self.categories}")
 
         self.resolution = 1008
@@ -161,7 +153,7 @@ class COCOSegmentDataset(Dataset):
         img_info = self.images[img_id]
 
         # Load image
-        img_path = self.split_dir / img_info['file_name']
+        img_path = self.image_dir / img_info.file_name
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
@@ -182,19 +174,13 @@ class COCOSegmentDataset(Dataset):
         scale_h = self.resolution / orig_h
 
         for i, ann in enumerate(annotations):
-            # Get bbox - format is [x, y, width, height] in COCO format
-            bbox_coco = ann.get("bbox", None)
-            if bbox_coco is None:
-                continue
-
             # Get class name from category_id
-            category_id = ann.get("category_id", 0)
-            class_name = self.categories.get(category_id, "object")
+            class_name = self.categories.get(ann.category_id, "object")
             object_class_names.append(class_name)
 
             # Convert from COCO [x, y, w, h] to normalized [cx, cy, w, h] (CxCyWH)
             # SAM3 internally expects boxes in CxCyWH format normalized to [0, 1]
-            x, y, w, h = bbox_coco
+            x, y, w, h = ann.bbox
             cx = x + w / 2.0
             cy = y + h / 2.0
 
@@ -208,24 +194,20 @@ class COCOSegmentDataset(Dataset):
 
             # Handle segmentation mask (polygon or RLE format)
             segment = None
-            segmentation = ann.get("segmentation", None)
+            segmentation = ann.segmentation
 
-            if segmentation:
+            if segmentation is not None:
                 try:
-                    # Check if it's RLE format (dict) or polygon format (list)
-                    if isinstance(segmentation, dict):
+                    if isinstance(segmentation, RLESegmentation):
                         # RLE format: {"counts": "...", "size": [h, w]}
-                        mask_np = mask_utils.decode(segmentation)
-                    elif isinstance(segmentation, list):
+                        rle_dict = {"counts": segmentation.counts, "size": segmentation.size}
+                        mask_np = mask_utils.decode(rle_dict)
+                    else:
                         # Polygon format: [[x1, y1, x2, y2, ...], ...]
                         # Convert polygon to RLE, then decode
                         rles = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
                         rle = mask_utils.merge(rles)
                         mask_np = mask_utils.decode(rle)
-                    else:
-                        print(f"Warning: Unknown segmentation format: {type(segmentation)}")
-                        segment = None
-                        continue
 
                     # Resize mask to model resolution
                     mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
@@ -889,31 +871,29 @@ class SAM3TrainerNative:
         
     def train(self):
         train_cfg = self.config.training
-        data_dir = train_cfg.data_dir
+        data_cfg = train_cfg.data
 
-        # Load datasets using COCO format
-        print_rank0(f"\nLoading training data from {data_dir}...")
-        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
+        # Load training dataset
+        print_rank0(f"\nLoading training data from {data_cfg.train.image_dir}...")
+        train_ds = COCOSegmentDataset(data_cfg.train)
 
-        # Check if validation data exists
+        # Load validation dataset (if configured)
         has_validation = False
         val_ds = None
 
-        try:
-            print_rank0(f"\nLoading validation data from {data_dir}...")
-            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid")
-            if len(val_ds) > 0:
-                has_validation = True
-                print_rank0(f"Found validation data: {len(val_ds)} images")
-            else:
-                print_rank0(f"Validation dataset is empty.")
+        if data_cfg.valid is not None:
+            try:
+                print_rank0(f"\nLoading validation data from {data_cfg.valid.image_dir}...")
+                val_ds = COCOSegmentDataset(data_cfg.valid)
+                if len(val_ds) > 0:
+                    has_validation = True
+                    print_rank0(f"Found validation data: {len(val_ds)} images")
+                else:
+                    print_rank0("Validation dataset is empty.")
+                    val_ds = None
+            except Exception as e:
+                print_rank0(f"Could not load validation data: {e}")
                 val_ds = None
-        except Exception as e:
-            print_rank0(f"Could not load validation data: {e}")
-            val_ds = None
-
-        if not has_validation:
-            val_ds = None
 
         def collate_fn(batch):
             return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
