@@ -797,7 +797,7 @@ class SAM3TrainerNative:
             device=self.device.type,
             compile=False,
             load_from_HF=True,
-            bpe_path=str(Path(__file__).resolve().parent / "testSamples" / "bpe_simple_vocab_16e6.txt.gz"),
+            bpe_path=None,
             eval_mode=False
         )
 
